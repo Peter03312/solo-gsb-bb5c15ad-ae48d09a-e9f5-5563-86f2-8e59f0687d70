@@ -13,6 +13,10 @@
 4. 评审人**不得评审自己声明回避的论文**；
 5. 评审人已分配论文数**不得超过其容量**。
 
+> 约束 1、3 中的"机构"一律按会务方维护的**机构归并组**判定：同一机构的不同原名归并后
+> 即视为同一机构（原名逐字相同与由归并造成的同组在预演诊断中分别标注，详见下文
+> "机构归并组"）。
+
 **优化目标**（多解时按优先级）：
 
 1. **最小化最高已用容量比例**（全体评审人中 `已分配数 / 容量` 的最大值）；
@@ -107,6 +111,29 @@ SQLite 写事务**（`BEGIN IMMEDIATE`）内完成，与资料修改并发不会
 - `GET /reviewers/{reviewer_id}/status` 可查看当前状态与**全部变更记录**
   （每次有效变更的目标状态、原因、推进后的修订号与时间）；评审人列表与详情同步包含 `active`。
 
+**机构归并组（同一机构的不同原名，会务方）**：会务方凭密钥对
+`POST /institutions/merge-groups` 提交**两个当前论文作者或评审人资料中出现过的
+机构原名**与**所见资料修订号 `base_revision`**，把它们归为同一个冲突判定组：
+
+- 归并关系**传递且不可拆分**：A 与 B 同组、B 与 C 同组，则 A 与 C 同组；
+  系统只提供归并，不存在拆组/移出操作（归并边永久保留）；
+- **同组重复提交幂等**（含交换两个名称的顺序、名称与自身归并）：`changed=false`，
+  不写归并边、不推进修订号；**有效归并**（两个原先不同的组首次合并）推进资料修订号 +1；
+- 请求在**同一个写事务内先核对修订号**：修订号过期/超前 `409`、名称首尾空白归一化后
+  为空白 `422`、任一名称未出现在当前资料中 `404`，被拒请求不写入任何边、不留下部分变更；
+- 成功响应返回**归并后的名称组**（`names`，按名称字典序）、**当前修订号** `revision`
+  与**是否变更** `changed`；会务方可 `GET /institutions/merge-groups`
+  查看全部归并组（含已删除资料名称的历史归并，仅供追溯）；
+- **普通分配与补位都按归并组判定机构冲突**——"评审人与作者同机构"与
+  "两名评审人是否同机构"一律比较归并组而非原名；预演解释须**标明由归并造成的冲突**
+  （原因代码带 `_via_merge` 后缀），原名逐字相同的冲突仍用原有原因代码；
+  **原始机构名称及既有响应字段保持原样**（资料、方案、评语、快照中均不改名）；
+- **已确认槽位因归并而失效时，补位不得固定该槽位**（两名已确认评审人被归并为同机构时
+  诊断 `fixed_pair_violates_institution_rule_via_merge`，释放后一槽位重算）；
+  旧发布版与评语仍可在会务方视图中追溯，补位发布继续遵守**双版本复核**
+  （`base_revision` + `base_serial`）及**评语继承**（保留槽位沿用同收据、
+  移出槽位评语进入 `archived_reviews`）规则。
+
 **权限模型**：
 
 | 角色 | 凭据 | 权限 |
@@ -172,6 +199,8 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 | GET | `/reviewers` | 评审人列表（含每人 `active` 资格状态） |
 | POST | `/reviewers/{reviewer_id}/status` | 停用/启用评审资格：`{"reviewer_id","base_revision","active","reason"}`；事务内先核对修订号，过期/超前 `409`，未知评审人 `404`，空原因 `422`，同状态异原因 `409`，同状态同原因重复提交幂等（`changed=false`），有效变更推进修订号 |
 | GET | `/reviewers/{reviewer_id}/status` | 查看评审人当前资格状态与全部变更记录（含每次原因、修订号、时间），未知评审人 `404` |
+| POST | `/institutions/merge-groups` | 机构归并：`{"name_a","name_b","base_revision"}`；两名称须为当前资料中出现的机构原名；过期/超前修订号 `409`，空白名称 `422`，未知名称 `404`，同组重复提交幂等（`changed=false`，不推进修订号），有效归并推进修订号；返回归并后的名称组 `names`、当前修订号与 `changed` |
+| GET | `/institutions/merge-groups` | 查看全部机构归并组（传递闭包，仅列 ≥2 个原名的组；归并不可拆分） |
 | POST | `/assignment/dry-run` | 预演：返回方案、未分配论文与限制原因、资料修订号；不影响已发布版 |
 | POST | `/assignment/publish` | 发布：携带 `{"base_revision": N}`，修订号过期 `409`，无可行方案 `422` |
 | POST | `/assignment/backfill/dry-run` | 补位预演：固定已确认关系，其余位置按原约束/优化次序重算；返回 `revision` 与 `serial` |
@@ -196,7 +225,9 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 匿名反馈快照流程见 [`examples/snapshots.sh`](examples/snapshots.sh)
 （`./examples/snapshots.sh`，建议对新库运行）；
 本轮评审资格停用/启用流程见 [`examples/eligibility.sh`](examples/eligibility.sh)
-（`./examples/eligibility.sh`，建议对新库运行）。
+（`./examples/eligibility.sh`，建议对新库运行）；
+本轮机构归并流程见 [`examples/institutions.sh`](examples/institutions.sh)
+（`./examples/institutions.sh`，建议对新库运行）。
 
 ```bash
 BASE=http://localhost:8000
@@ -351,6 +382,48 @@ curl $BASE/reviewers/R1/status -H "$ORG"
 #     {"active":true,"reason":"假期结束恢复评审","revision":12,"changed_at":"..."}]}
 ```
 
+### 本轮用法：机构归并组（同一机构的不同原名）
+
+```bash
+# 26. 先取当前资料修订号, 再提交两个"当前资料中出现过"的机构原名
+REV=$(curl -s $BASE/meta -H "$ORG" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')
+curl -X POST $BASE/institutions/merge-groups -H "$ORG" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name_a\": \"Acme-U\", \"name_b\": \"Acme University\", \"base_revision\": $REV}"
+# -> {"ok":true,"changed":true,"revision":N+1,
+#     "names":["Acme University","Acme-U"],"group_key":"Acme University",
+#     "submitted":["Acme-U","Acme University"]}
+
+# 27. 同组重复提交 (含交换顺序) 幂等 changed=false, 不推进修订号、不写归并边;
+#     名称与自身归并同样幂等; 归并关系传递: A~B、B~C => A 与 C 同组, 再提交 A、C 幂等
+#     过期/超前修订号 -> 409; 空白名称 -> 422; 名称未出现在当前论文/评审人资料 -> 404
+#     (被拒请求不写入任何边, 不留下部分变更)
+curl $BASE/institutions/merge-groups -H "$ORG"
+# -> {"revision":N+1,"groups":[
+#     {"group_key":"Acme University","names":["Acme University","Acme-U"],"size":2}]}
+
+# 28. 普通预演按归并组判定冲突, 解释标明"由归并造成":
+curl -X POST $BASE/assignment/dry-run -H "$ORG"
+# 评审人机构 "Acme-U" 与作者机构 "Acme University" 已归并 ->
+#   papers.P1.excluded: [{"reviewer_id":"R1","reason":"same_institution_as_author_via_merge"}]
+# 两名评审人原名不同但同归并组 -> 不能同篇配对; 全部合格者同组且无可行方案时,
+#   诊断原因 eligible_reviewers_share_single_institution_via_merge
+# (原名逐字相同的冲突仍使用 same_institution_as_author 等既有原因代码;
+#  资料与响应中的原始机构名称保持原样, 不做替换)
+
+# 29. 已确认槽位因归并失效 (两名已确认评审人被归并为同机构) 时,
+#     补位预演不固定该槽位:
+curl -X POST $BASE/assignment/backfill/dry-run -H "$ORG"
+# -> fixed_problems.P1: [{"reviewer_id":"R4",
+#     "reason":"fixed_pair_violates_institution_rule_via_merge"}],
+#    fixed.P1: ["R3"], plan.P1: ["R3","R5"]
+# 30. 补位发布仍需双版本复核; 保留槽位的确认与评语沿用 (同收据),
+#     被移出槽位的评语仅供会务方追溯 (archived_reviews)
+curl -X POST $BASE/assignment/backfill/publish -H "$ORG" \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision": N, "base_serial": S}'
+```
+
 预演响应示例（可行）：
 
 ```json
@@ -388,21 +461,26 @@ curl $BASE/reviewers/R1/status -H "$ORG"
 |---|---|
 | 401 | 会务方密钥缺失/错误；评审人凭据缺失/失效 |
 | 403 | 评审资格已停用：凭据本身仍有效，但取稿、提交决定、提交评语、查看本人评语一律立即拒绝 |
-| 404 | 更新/删除不存在的论文或评审人；调整资格或查看变更记录时评审人未知；尚未发布方案；评审人对**未分配给自己/已被移出当前方案**的论文提交决定或评语；会务方查询当前发布版中不存在的论文评语；尚无发布版时补位预演/发布；反馈快照的访问码无效或已失效（旧码，不区分论文是否存在）；未发布或论文不在当前发布版时发布快照 |
-| 409 | 论文/评审人编号重复；发布携带的修订号已过期（资料已变更）；补位发布携带的资料修订号或发布序号过期；已回避任务再次确认；评语提交携带的发布序号过期/超前；对 `pending`/`recused` 槽位提交评语；同一有效任务已有评语而提交内容不同（冲突）；反馈快照请求携带的发布序号过期/超前；资格调整携带的修订号过期/超前；同状态异原因的资格调整（含对初始启用者再次启用） |
-| 422 | 非法容量（非整数、小于 1）、缺字段等参数校验失败；无可行方案时强行发布；回避原因为空；补位预演无法补齐为完整方案时强行补位发布；评分不是 1～5 的整数或评语为空白；路径论文编号与请求体不一致；路径评审人编号与请求体不一致；资格调整原因为空；发布反馈快照时两名评审人未全部确认或两份正式评语未交齐（不留下新版本） |
+| 404 | 更新/删除不存在的论文或评审人；调整资格或查看变更记录时评审人未知；尚未发布方案；评审人对**未分配给自己/已被移出当前方案**的论文提交决定或评语；会务方查询当前发布版中不存在的论文评语；尚无发布版时补位预演/发布；反馈快照的访问码无效或已失效（旧码，不区分论文是否存在）；未发布或论文不在当前发布版时发布快照；机构归并时任一名称未出现在当前论文作者或评审人资料中 |
+| 409 | 论文/评审人编号重复；发布携带的修订号已过期（资料已变更）；补位发布携带的资料修订号或发布序号过期；已回避任务再次确认；评语提交携带的发布序号过期/超前；对 `pending`/`recused` 槽位提交评语；同一有效任务已有评语而提交内容不同（冲突）；反馈快照请求携带的发布序号过期/超前；资格调整携带的修订号过期/超前；同状态异原因的资格调整（含对初始启用者再次启用）；机构归并携带的修订号过期/超前 |
+| 422 | 非法容量（非整数、小于 1）、缺字段等参数校验失败；无可行方案时强行发布；回避原因为空；补位预演无法补齐为完整方案时强行补位发布；评分不是 1～5 的整数或评语为空白；路径论文编号与请求体不一致；路径评审人编号与请求体不一致；资格调整原因为空；发布反馈快照时两名评审人未全部确认或两份正式评语未交齐（不留下新版本）；机构归并的名称去首尾空白后为空白 |
 
-排除/限制原因代码：`same_institution_as_author`（与作者同机构）、`on_reviewer_avoid_list`
+排除/限制原因代码：`same_institution_as_author`（与作者同机构，原名逐字相同）、
+`same_institution_as_author_via_merge`（评审人与作者机构原名不同但已归并为同一冲突判定组）、
+`on_reviewer_avoid_list`
 （在回避名单）、`hard_recusal_after_decline`（评审人发布后声明回避形成的硬回避）、
 `reviewer_disabled`（评审资格已停用，不进入普通分配）、
 `fewer_than_two_eligible_reviewers`（合格者不足两人）、
 `eligible_reviewers_at_capacity`（合格者容量占满）、`no_expert_among_eligible_reviewers`
 （合格者无人擅长主题）、`eligible_reviewers_share_single_institution`（合格者同属一个机构）、
+`eligible_reviewers_share_single_institution_via_merge`（合格者机构原名互异但同属一个归并组）、
 `no_valid_reviewer_pair`（不存在合法评审人对）、`all_valid_pairs_blocked_by_capacity`
 （所有合法评审人对均被容量阻塞）。补位专用：`fixed_reviewer_not_found`（固定关系中的评审人
 已被删除）、`fixed_reviewer_disabled`（固定关系中的评审人资格已停用，槽位释放）、
 `fixed_pair_violates_institution_rule` / `fixed_pair_violates_expert_rule`
-（数据变更后固定两人不再满足不同机构/至少一名擅长）、`fixed_assignments_exceed_capacity`
+（数据变更后固定两人不再满足不同机构/至少一名擅长）、
+`fixed_pair_violates_institution_rule_via_merge`（固定两人原名不同，但机构归并后同组，
+已确认槽位因此失效、不予固定）、`fixed_assignments_exceed_capacity`
 （固定关系累计超过评审人容量）、`no_valid_pair_containing_fixed_reviewer`
 （含固定评审人的合法对不存在）、`all_fixed_compatible_pairs_blocked_by_capacity`
 （与固定评审人相容的评审人对均被容量阻塞）。
@@ -411,20 +489,22 @@ curl $BASE/reviewers/R1/status -H "$ORG"
 
 ```
 app/
-  main.py     # FastAPI 路由、鉴权、发布/补位发布事务、评审人决定与正式评语、匿名反馈快照、评审资格停用/启用
-  solver.py   # 分配求解器 + 补位求解器（固定位置、容量比例、字典序、部分方案与诊断；停用者直接排除）
-  db.py       # SQLite 连接、schema 初始化/迁移、修订号、发布序号、读写事务、评审资格状态与变更记录
+  main.py     # FastAPI 路由、鉴权、发布/补位发布事务、评审人决定与正式评语、匿名反馈快照、评审资格停用/启用、机构归并组
+  solver.py   # 分配求解器 + 补位求解器（固定位置、容量比例、字典序、部分方案与诊断；停用者直接排除；机构冲突一律按归并组判定）
+  db.py       # SQLite 连接、schema 初始化/迁移、修订号、发布序号、读写事务、评审资格状态与变更记录、机构归并边与并查集分组
   schemas.py  # 请求体模型与校验
-tests/test_api.py         # 原有接口与求解器测试（含并发发布测试）
-tests/test_backfill.py    # 确认/回避/硬回避/补位预演与发布测试
-tests/test_reviews.py     # 正式评分/评语、收据幂等与冲突、进度与归档、补位沿用测试
-tests/test_snapshots.py   # 匿名反馈快照：发布门槛、幂等原码、新版本旧码失效、统一 404、追溯
-tests/test_eligibility.py # 本轮评审资格停用/启用：修订号核对、幂等/冲突、即时 403、槽位释放与恢复、变更记录
+tests/test_api.py                # 原有接口与求解器测试（含并发发布测试）
+tests/test_backfill.py           # 确认/回避/硬回避/补位预演与发布测试
+tests/test_reviews.py            # 正式评分/评语、收据幂等与冲突、进度与归档、补位沿用测试
+tests/test_snapshots.py          # 匿名反馈快照：发布门槛、幂等原码、新版本旧码失效、统一 404、追溯
+tests/test_eligibility.py        # 评审资格停用/启用：修订号核对、幂等/冲突、即时 403、槽位释放与恢复、变更记录
+tests/test_institution_merges.py # 本轮机构归并：修订号核对、传递不可拆分、幂等、归并组冲突判定、预演归并标注、补位失效不固定、评语继承
 examples/demo.sh          # 端到端 curl 示例（录入 -> 预演 -> 发布 -> 取稿）
 examples/backfill.sh      # 确认/回避 -> 补位预演 -> 双版本复核发布示例
 examples/reviews.sh       # 正式评语收集端到端示例（确认 -> 提交评语 -> 进度查看 -> 补位沿用/归档）
 examples/snapshots.sh     # 匿名反馈快照端到端示例（发布快照 -> 持码读取 -> 幂等 -> 序号变化旧码失效 -> 追溯）
-examples/eligibility.sh   # 本轮端到端示例（停用 -> 即时断稿/排除 -> 补位释放 -> 重新启用 -> 变更记录）
+examples/eligibility.sh   # 评审资格停用/启用端到端示例（停用 -> 即时断稿/排除 -> 补位释放 -> 重新启用 -> 变更记录）
+examples/institutions.sh  # 本轮端到端示例（机构归并 -> 普通分配按组冲突 -> 已确认槽位失效 -> 补位双版本发布 -> 归并组查看）
 Dockerfile / docker-compose.yml
 ```
 

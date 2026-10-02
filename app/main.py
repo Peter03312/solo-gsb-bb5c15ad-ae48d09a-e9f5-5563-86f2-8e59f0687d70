@@ -20,6 +20,7 @@ from . import db
 from .schemas import (
     AssignmentDecisionIn,
     BackfillPublishIn,
+    InstitutionMergeIn,
     PaperIn,
     PaperUpdate,
     PublishIn,
@@ -130,6 +131,15 @@ def _load_domain(conn):
     return papers, reviewers
 
 
+def _institution_groups(conn):
+    """当前机构归并组 {原名: 组键}, 仅覆盖当前论文作者/评审人资料中出现的名称。
+
+    归并边永久保留 (关系传递且不可拆分); 已删除资料中的名称仍参与并查集,
+    不影响其余名称的归组。求解器内一切机构冲突均按该组判定。
+    """
+    return db.institution_groups(conn, known=db.current_institution_names(conn))
+
+
 def _paper_row_to_dict(row):
     return {
         "paper_id": row["paper_id"],
@@ -205,7 +215,11 @@ def _build_backfill(conn, published_row):
     paper_ids = {p.paper_id for p in all_papers}
     scoped_papers = [p for p in all_papers if p.paper_id in plan and p.paper_id in paper_ids]
     result = compute_backfill(
-        scoped_papers, all_reviewers, fixed, recused_pairs=_recused_pairs(conn)
+        scoped_papers,
+        all_reviewers,
+        fixed,
+        recused_pairs=_recused_pairs(conn),
+        inst_group=_institution_groups(conn),
     )
     result["serial"] = serial
     result["published_revision"] = published_row["revision"]
@@ -483,6 +497,122 @@ def get_reviewer_status(reviewer_id: str, _: bool = Depends(require_organizer)):
     }
 
 
+# ---------------------------------------------------------------- 机构归并组 (会务方)
+
+def _merge_group_view(conn):
+    """按归并边构造全部归并组视图: 仅含 >=2 个原名的组, 按组键字典序。
+
+    组的成员取自归并边中出现过的名称 (即会务方曾提交归并的原名);
+    这些边永久保留、不可拆分, 故名称即使已不在当前资料中也保留可追溯。
+    """
+    return [
+        {"group_key": root, "names": names, "size": len(names)}
+        for root, names in sorted(_merge_component_names(conn).items())
+        if len(names) >= 2
+    ]
+
+
+def _merge_component_names(conn):
+    """返回 {归并组键: [该连通分量内出现于归并边的全部原名]}。
+
+    与求解器使用的分组不同, 这里不限制为"当前资料中的名称":
+    归并边永久保留, 已删除资料中的名称仍是归并组的可追溯成员。
+    """
+    edges = db.institution_merge_edges(conn)
+    groups = db.institution_groups(conn)
+    buckets: dict[str, set[str]] = {}
+    for a, b in edges:
+        buckets.setdefault(groups[a], set()).update((a, b))
+    return {root: sorted(names) for root, names in buckets.items()}
+
+
+@app.post("/institutions/merge-groups")
+def merge_institutions(body: InstitutionMergeIn, _: bool = Depends(require_organizer)):
+    """会务方把同一机构的两个原名归并为同一冲突判定组。
+
+    - 两个名称都必须是"当前论文作者或评审人资料中出现过"的机构原名;
+    - 请求须携带所见资料修订号, 与当前不一致 (过期/超前) 即 409;
+    - 名称去除首尾空白后为空白 -> 422; 任一名称未知 (未在当前资料中出现) -> 404;
+    - 归并关系传递且不可拆分: 两个名称已在同一组时为同组重复提交,
+      幂等返回 (changed=false), 不写边、不推进修订号;
+    - 有效归并 (两个原先不同的组首次合并) 写入归并边并推进资料修订号 +1;
+    - 被拒请求 (409/422/404) 不写入任何边, 也不留下部分变更。
+    返回归并后的名称组 (按名称字典序)、当前修订号与是否变更。
+    """
+    name_a = body.name_a.strip()
+    name_b = body.name_b.strip()
+
+    now = datetime.now(timezone.utc).isoformat()
+    with db.write_txn() as conn:
+        rev = db.get_revision(conn)
+        if body.base_revision != rev:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"资料已变更: 归并请求基于修订号 {body.base_revision},"
+                    f" 当前修订号为 {rev}, 请重新查看资料后再提交"
+                ),
+            )
+        if not name_a or not name_b:
+            raise HTTPException(
+                status_code=422,
+                detail="机构名称不得为空白 (both institution names must be non-blank)",
+            )
+        known = db.current_institution_names(conn)
+        unknown = sorted({name for name in (name_a, name_b) if name not in known})
+        if unknown:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "机构原名未出现在当前论文作者或评审人资料中, 无法归并: "
+                    + ", ".join(unknown)
+                ),
+            )
+
+        groups = db.institution_groups(conn, known=known)
+        root_a, root_b = groups[name_a], groups[name_b]
+        if root_a == root_b:
+            # 同组重复提交: 幂等, 不写边、不推进修订号。
+            # 名称组按归并边的连通分量返回 (含已离开当前资料的历史原名);
+            # 名称与自身归并且尚无任何边时, 组仅含该名称自身。
+            members = _merge_component_names(conn).get(root_a, [name_a])
+            return {
+                "ok": True,
+                "changed": False,
+                "revision": rev,
+                "names": members,
+                "group_key": root_a,
+                "submitted": [name_a, name_b],
+            }
+
+        conn.execute(
+            "INSERT INTO institution_merges(name_a, name_b, revision, merged_at)"
+            " VALUES (?,?,?,?)",
+            (name_a, name_b, rev + 1, now),
+        )
+        new_rev = db.bump_revision(conn)
+        new_groups = db.institution_groups(conn, known=known)
+        new_root = new_groups[name_a]
+        members = _merge_component_names(conn)[new_root]
+    return {
+        "ok": True,
+        "changed": True,
+        "revision": new_rev,
+        "names": members,
+        "group_key": new_root,
+        "submitted": [name_a, name_b],
+    }
+
+
+@app.get("/institutions/merge-groups")
+def list_institution_merge_groups(_: bool = Depends(require_organizer)):
+    """会务方查看当前全部机构归并组 (归并关系传递且不可拆分; 仅列 >=2 个原名的组)。"""
+    with db.read_txn() as conn:
+        rev = db.get_revision(conn)
+        groups = _merge_group_view(conn)
+    return {"revision": rev, "groups": groups}
+
+
 # ---------------------------------------------------------------- 预演 / 发布 (会务方)
 
 @app.post("/assignment/dry-run")
@@ -492,7 +622,8 @@ def dry_run(_: bool = Depends(require_organizer)):
         rev = db.get_revision(conn)
         papers, reviewers = _load_domain(conn)
         recused = _recused_pairs(conn)
-    result = compute_assignment(papers, reviewers, recused)
+        groups = _institution_groups(conn)
+    result = compute_assignment(papers, reviewers, recused, groups)
     result["revision"] = rev
     return result
 
@@ -515,7 +646,9 @@ def publish(body: PublishIn, _: bool = Depends(require_organizer)):
                 ),
             )
         papers, reviewers = _load_domain(conn)
-        result = compute_assignment(papers, reviewers, _recused_pairs(conn))
+        result = compute_assignment(
+            papers, reviewers, _recused_pairs(conn), _institution_groups(conn)
+        )
         if not result["feasible"]:
             raise HTTPException(
                 status_code=422,

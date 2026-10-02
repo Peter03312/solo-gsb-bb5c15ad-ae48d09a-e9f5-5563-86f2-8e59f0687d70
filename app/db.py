@@ -17,11 +17,15 @@
   (仅当某发布序号下两名评审人均已确认且各提交一份正式评语时生成;
   以 (paper_id, serial, receipt1, receipt2) 幂等, 来源变化即新发布序号 -> version+1
   与新随机访问码, 旧码立即失效, 旧版行保留仅供会务方追溯);
+- institution_merges 表保存会务方提交的机构归并边 (同一机构的不同原名);
+  全表边以并查集解释为冲突判定组, 关系传递且不可拆分, 仅有效归并写入并推进修订号,
+  普通分配与补位均按归并组判定"作者同机构"与"两名评审人同机构";
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -124,6 +128,17 @@ CREATE TABLE IF NOT EXISTS feedback_snapshots (
     created_at   TEXT NOT NULL,
     UNIQUE (paper_id, serial, receipt1, receipt2)
 );
+-- 会务方提交的机构归并边 (同一机构的不同原名)。归并关系传递且不可拆分:
+-- 全表边以并查集解释为冲突判定组, 任何提交只能增加边 (使组变大),
+-- 不存在"拆组/移出"操作; 同组重复提交幂等, 不写边、不推进修订号。
+-- 仅有效归并 (使两个原先不同的组合并) 写入一行并推进资料修订号。
+CREATE TABLE IF NOT EXISTS institution_merges (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    name_a       TEXT NOT NULL,   -- 请求中的机构原名 (首尾空白归一化后的原样名称)
+    name_b       TEXT NOT NULL,
+    revision     INTEGER NOT NULL,  -- 本次有效归并推进后的资料修订号
+    merged_at    TEXT NOT NULL
+);
 """
 
 
@@ -163,6 +178,69 @@ def bump_revision(conn: sqlite3.Connection) -> int:
     rev = get_revision(conn) + 1
     conn.execute("UPDATE meta SET value = ? WHERE key = 'revision'", (str(rev),))
     return rev
+
+
+# ------------------------------------------------------------ 机构归并组 (并查集)
+
+def institution_merge_edges(conn: sqlite3.Connection):
+    """全部机构归并边, 按提交顺序 (id) 返回 [(name_a, name_b), ...]。"""
+    return [
+        (r["name_a"], r["name_b"])
+        for r in conn.execute(
+            "SELECT name_a, name_b FROM institution_merges ORDER BY id"
+        ).fetchall()
+    ]
+
+
+def institution_groups(conn: sqlite3.Connection, known=None):
+    """按并查集解释归并边, 返回 {机构原名: 归并组键}。
+
+    归并关系传递且不可拆分: 全表边构成无向图, 同一连通分量内的所有名称
+    映射到同一组键 (组内按名称排序后的首个名称, 随归并扩组可能变化,
+    仅用于冲突判定的内部键)。
+
+    known: 可选的当前资料机构原名集合; 给出时结果只包含这些名称
+    (已被删除的资料名称仍参与并查集, 不影响其余名称的归组),
+    未归并名称映射到自身。
+    """
+    parent: dict[str, str] = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            # 确定性地以较小名称为根, 组键不依赖边的插入方向
+            small, large = (ra, rb) if ra < rb else (rb, ra)
+            parent[large] = small
+
+    for a, b in institution_merge_edges(conn):
+        union(a, b)
+
+    names = set(parent)
+    if known is not None:
+        names |= set(known)
+    return {name: find(name) for name in names}
+
+
+def current_institution_names(conn: sqlite3.Connection):
+    """当前论文作者或评审人资料中出现过的非空机构原名集合 (原样, 不做空白归一化)。"""
+    names = set()
+    for r in conn.execute("SELECT institution FROM reviewers").fetchall():
+        if r["institution"]:
+            names.add(r["institution"])
+    for r in conn.execute("SELECT institutions FROM papers").fetchall():
+        for name in json.loads(r["institutions"]):
+            if name:
+                names.add(name)
+    return names
 
 
 @contextmanager

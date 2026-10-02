@@ -67,3 +67,9 @@ class ReviewerStatusIn(BaseModel):
     base_revision: int = Field(ge=0, description="所见到的资料修订号; 与当前不一致即过期")
     active: bool = Field(description="目标状态: false=停用, true=启用")
     reason: str = Field(min_length=1, max_length=1000, description="非空原因 (首尾空白归一化后仍须非空)")
+
+
+class InstitutionMergeIn(BaseModel):
+    name_a: str = Field(min_length=1, max_length=256, description="当前论文作者或评审人资料中出现的机构原名")
+    name_b: str = Field(min_length=1, max_length=256, description="当前论文作者或评审人资料中出现的机构原名")
+    base_revision: int = Field(ge=0, description="所见到的资料修订号; 与当前不一致即过期")
