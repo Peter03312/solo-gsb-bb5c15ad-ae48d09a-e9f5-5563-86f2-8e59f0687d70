@@ -20,6 +20,7 @@ from . import db
 from .schemas import (
     AssignmentDecisionIn,
     BackfillPublishIn,
+    InstitutionMergeIn,
     PaperIn,
     PaperUpdate,
     PublishIn,
@@ -101,6 +102,25 @@ def _recused_pairs(conn):
         (r["reviewer_id"], r["paper_id"])
         for r in conn.execute("SELECT reviewer_id, paper_id FROM reviewer_recusals").fetchall()
     }
+
+
+def _institution_groups(conn):
+    """返回 {机构原名: 组号}: 会务方维护的机构归并组 (未归并名称不在表中)。"""
+    return {
+        r["name"]: r["group_id"]
+        for r in conn.execute("SELECT name, group_id FROM institution_merge_members").fetchall()
+    }
+
+
+def _known_institution_names(conn):
+    """当前论文作者机构与评审人机构中出现的全部机构原名。"""
+    names = {
+        r["institution"]
+        for r in conn.execute("SELECT institution FROM reviewers").fetchall()
+    }
+    for r in conn.execute("SELECT institutions FROM papers").fetchall():
+        names.update(json.loads(r["institutions"]))
+    return names
 
 
 def _load_domain(conn):
@@ -205,7 +225,9 @@ def _build_backfill(conn, published_row):
     paper_ids = {p.paper_id for p in all_papers}
     scoped_papers = [p for p in all_papers if p.paper_id in plan and p.paper_id in paper_ids]
     result = compute_backfill(
-        scoped_papers, all_reviewers, fixed, recused_pairs=_recused_pairs(conn)
+        scoped_papers, all_reviewers, fixed,
+        recused_pairs=_recused_pairs(conn),
+        institution_groups=_institution_groups(conn),
     )
     result["serial"] = serial
     result["published_revision"] = published_row["revision"]
@@ -483,6 +505,140 @@ def get_reviewer_status(reviewer_id: str, _: bool = Depends(require_organizer)):
     }
 
 
+# ------------------------------------------------ 机构归并组 (会务方)
+
+def _merge_group_members(conn, group_id):
+    """某归并组的全部机构原名 (按名称排序)。"""
+    return [
+        r["name"]
+        for r in conn.execute(
+            "SELECT name FROM institution_merge_members WHERE group_id = ? ORDER BY name",
+            (group_id,),
+        ).fetchall()
+    ]
+
+
+@app.post("/institutions/merges")
+def merge_institutions(body: InstitutionMergeIn, _: bool = Depends(require_organizer)):
+    """会务方把同一机构的两个不同名称归并为同一冲突判定组。
+
+    在同一个写事务内先核对资料修订号, 再处理归并:
+      - 修订号与当前不一致 (过期/超前) -> 409, 不留任何变更;
+      - 名称为空白 -> 422; 名称未出现在当前论文作者或评审人资料中 -> 404;
+      - 两名称已属同一归并组 (含两名称相同) -> 幂等 (changed=false),
+        不推进修订号、不写记录;
+      - 有效归并: 归并关系传递 (两组并为一组) 且不可拆分, 推进资料修订号;
+        普通分配与补位随即按归并组判定机构冲突, 仅因归并才成立的冲突在
+        预演解释中以 *_via_merged_group 原因代码标明。
+    原始机构名称在论文/评审人资料与既有响应字段中保持原样。
+    """
+    name_a, name_b = body.name_a.strip(), body.name_b.strip()
+    now = datetime.now(timezone.utc).isoformat()
+    with db.write_txn() as conn:
+        rev = db.get_revision(conn)
+        if body.base_revision != rev:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"资料已变更: 请求基于修订号 {body.base_revision}, "
+                    f"当前修订号为 {rev}, 请重新查看资料后再归并"
+                ),
+            )
+        if not name_a or not name_b:
+            raise HTTPException(
+                status_code=422, detail="机构名称必须非空 (non-empty institution names are required)"
+            )
+        known = _known_institution_names(conn)
+        unknown = sorted({name_a, name_b} - known)
+        if unknown:
+            raise HTTPException(
+                status_code=404,
+                detail=f"机构名称未出现在当前论文作者或评审人资料中: {', '.join(unknown)}",
+            )
+        members = _institution_groups(conn)
+        group_a, group_b = members.get(name_a), members.get(name_b)
+        if group_a is not None and group_a == group_b:
+            # 同组重复提交 (含两名称相同且已归并): 幂等, 不推进修订号
+            return {
+                "ok": True,
+                "group_id": group_a,
+                "names": _merge_group_members(conn, group_a),
+                "changed": False,
+                "revision": rev,
+            }
+        if name_a == name_b:
+            # 同一名称重复提交且尚未归并: 其"组"即自身, 幂等不推进修订号
+            return {
+                "ok": True,
+                "group_id": None,
+                "names": [name_a],
+                "changed": False,
+                "revision": rev,
+            }
+        if group_a is None and group_b is None:
+            while True:
+                target = f"ig-{secrets.token_hex(8)}"
+                if conn.execute(
+                    "SELECT 1 FROM institution_merge_groups WHERE group_id = ?", (target,)
+                ).fetchone() is None:
+                    break
+            new_rev = db.bump_revision(conn)
+            conn.execute(
+                "INSERT INTO institution_merge_groups(group_id, created_revision, created_at)"
+                " VALUES (?,?,?)",
+                (target, new_rev, now),
+            )
+        elif group_a is not None and group_b is not None:
+            # 传递并组: 确定性保留较小组号, 另一组全体成员并入后解散 (不可拆分)
+            target, other = min(group_a, group_b), max(group_a, group_b)
+            conn.execute(
+                "UPDATE institution_merge_members SET group_id = ? WHERE group_id = ?",
+                (target, other),
+            )
+            conn.execute("DELETE FROM institution_merge_groups WHERE group_id = ?", (other,))
+            new_rev = db.bump_revision(conn)
+        else:
+            target = group_a if group_a is not None else group_b
+            new_rev = db.bump_revision(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO institution_merge_members(name, group_id) VALUES (?,?)",
+            (name_a, target),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO institution_merge_members(name, group_id) VALUES (?,?)",
+            (name_b, target),
+        )
+        names = _merge_group_members(conn, target)
+    return {
+        "ok": True,
+        "group_id": target,
+        "names": names,
+        "changed": True,
+        "revision": new_rev,
+    }
+
+
+@app.get("/institutions/merges")
+def list_institution_merges(_: bool = Depends(require_organizer)):
+    """会务方查看当前全部机构归并组 (未归并的机构名称不列出, 各自独立成组)。"""
+    with db.read_txn() as conn:
+        rev = db.get_revision(conn)
+        rows = conn.execute(
+            "SELECT group_id, created_revision, created_at"
+            " FROM institution_merge_groups ORDER BY group_id"
+        ).fetchall()
+        groups = [
+            {
+                "group_id": r["group_id"],
+                "names": _merge_group_members(conn, r["group_id"]),
+                "created_revision": r["created_revision"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+    return {"revision": rev, "groups": groups}
+
+
 # ---------------------------------------------------------------- 预演 / 发布 (会务方)
 
 @app.post("/assignment/dry-run")
@@ -492,7 +648,8 @@ def dry_run(_: bool = Depends(require_organizer)):
         rev = db.get_revision(conn)
         papers, reviewers = _load_domain(conn)
         recused = _recused_pairs(conn)
-    result = compute_assignment(papers, reviewers, recused)
+        groups = _institution_groups(conn)
+    result = compute_assignment(papers, reviewers, recused, institution_groups=groups)
     result["revision"] = rev
     return result
 
@@ -515,7 +672,10 @@ def publish(body: PublishIn, _: bool = Depends(require_organizer)):
                 ),
             )
         papers, reviewers = _load_domain(conn)
-        result = compute_assignment(papers, reviewers, _recused_pairs(conn))
+        result = compute_assignment(
+            papers, reviewers, _recused_pairs(conn),
+            institution_groups=_institution_groups(conn),
+        )
         if not result["feasible"]:
             raise HTTPException(
                 status_code=422,

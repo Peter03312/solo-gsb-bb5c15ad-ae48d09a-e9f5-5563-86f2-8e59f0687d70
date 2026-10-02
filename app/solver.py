@@ -13,12 +13,27 @@
   1. 最小化全体评审人中最高的"已用容量比例"(已分配数 / 容量);
   2. 在此前提下, 按 (论文编号升序, 每篇的评审人编号对升序) 展开的全局序列
      取字典序最小的方案。
+
+机构归并组 (institution_groups): 会务方维护的 {机构原名: 组号} 映射。
+同组名称共享冲突判定键, 未归并名称以自身为键; 机构相等性一律按判定键比较,
+原始名称在响应中保持原样。仅因归并才成立的冲突在解释中以
+*_via_merged_group 原因代码标明。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from fractions import Fraction
 from itertools import combinations
+
+
+def _inst_key(name, groups):
+    """机构名称的冲突判定键: 归并组内名称共享组键, 未归并名称以自身为键。
+
+    返回 (是否归并, 键) 二元组, 保证归并组键与原始名称不会误判相等。
+    """
+    if groups and name in groups:
+        return (1, groups[name])
+    return (0, name)
 
 
 @dataclass(frozen=True)
@@ -45,19 +60,27 @@ def is_expert(reviewer: Reviewer, paper: Paper) -> bool:
     return not reviewer.topics.isdisjoint(paper.topics)
 
 
-def analyze_paper(paper: Paper, reviewers, recused_pairs=()):
+def analyze_paper(paper: Paper, reviewers, recused_pairs=(), groups=None):
     """返回 (eligible, excluded, pairs)。
 
     eligible: 通过机构回避与回避名单过滤的评审人 (按编号升序);
-    excluded: 被排除评审人及原因 (评审人通过决定接口声明的硬回避单独标注);
+    excluded: 被排除评审人及原因 (评审人通过决定接口声明的硬回避单独标注;
+              仅因机构归并组才成立的同机构冲突以 *_via_merged_group 标明);
     pairs:    忽略容量时该论文的全部合法评审人对 (元组内与元组间均按编号升序)。
     """
+    groups = groups or {}
+    author_keys = {_inst_key(name, groups) for name in paper.institutions}
     eligible, excluded = [], []
     for r in reviewers:  # callers 保证 reviewers 已按 reviewer_id 升序
         if not r.active:
             excluded.append({"reviewer_id": r.reviewer_id, "reason": "reviewer_disabled"})
-        elif r.institution in paper.institutions:
-            excluded.append({"reviewer_id": r.reviewer_id, "reason": "same_institution_as_author"})
+        elif _inst_key(r.institution, groups) in author_keys:
+            reason = (
+                "same_institution_as_author"
+                if r.institution in paper.institutions  # 原始名称直接相同
+                else "same_institution_as_author_via_merged_group"  # 仅因归并组才相同
+            )
+            excluded.append({"reviewer_id": r.reviewer_id, "reason": reason})
         elif paper.paper_id in r.avoid_papers:
             reason = (
                 "hard_recusal_after_decline"
@@ -69,7 +92,7 @@ def analyze_paper(paper: Paper, reviewers, recused_pairs=()):
             eligible.append(r)
     pairs = []
     for a, b in combinations(eligible, 2):
-        if a.institution == b.institution:
+        if _inst_key(a.institution, groups) == _inst_key(b.institution, groups):
             continue
         if not (is_expert(a, paper) or is_expert(b, paper)):
             continue
@@ -78,12 +101,15 @@ def analyze_paper(paper: Paper, reviewers, recused_pairs=()):
 
 
 class Solver:
-    def __init__(self, papers, reviewers, recused_pairs=()):
+    def __init__(self, papers, reviewers, recused_pairs=(), institution_groups=None):
         self.papers = sorted(papers, key=lambda p: p.paper_id)
         self.reviewers = sorted(reviewers, key=lambda r: r.reviewer_id)
+        self.groups = dict(institution_groups or {})
         self.info = {}
         for p in self.papers:
-            eligible, excluded, pairs = analyze_paper(p, self.reviewers, recused_pairs)
+            eligible, excluded, pairs = analyze_paper(
+                p, self.reviewers, recused_pairs, self.groups
+            )
             self.info[p.paper_id] = {"eligible": eligible, "excluded": excluded, "pairs": pairs}
 
     # ---------- 完整方案 ----------
@@ -224,8 +250,7 @@ class Solver:
                 reasons.append("eligible_reviewers_at_capacity")
             if not any(is_expert(r, paper) for r in eligible):
                 reasons.append("no_expert_among_eligible_reviewers")
-            if len(eligible) >= 2 and len({r.institution for r in eligible}) < 2:
-                reasons.append("eligible_reviewers_share_single_institution")
+            reasons.extend(_single_institution_reasons(eligible, self.groups))
             if not pairs:
                 reasons.append("no_valid_reviewer_pair")
             elif not any(loads[a] < caps[a] and loads[b] < caps[b] for a, b in pairs):
@@ -247,9 +272,20 @@ def _loads_of(plan):
     return loads
 
 
-def compute_assignment(papers, reviewers, recused_pairs=()):
+def _single_institution_reasons(eligible, groups):
+    """合格者同属一个机构的诊断原因 (按归并组判定; 仅因归并才成立时单独标明)。"""
+    if len(eligible) < 2:
+        return []
+    if len({_inst_key(r.institution, groups) for r in eligible}) >= 2:
+        return []
+    if len({r.institution for r in eligible}) < 2:
+        return ["eligible_reviewers_share_single_institution"]
+    return ["eligible_reviewers_share_single_institution_via_merged_group"]
+
+
+def compute_assignment(papers, reviewers, recused_pairs=(), institution_groups=None):
     """求解入口。返回可 JSON 序列化的结果字典。"""
-    solver = Solver(papers, reviewers, recused_pairs)
+    solver = Solver(papers, reviewers, recused_pairs, institution_groups)
     reviewer_by_id = {r.reviewer_id: r for r in solver.reviewers}
     explanations = {
         pid: {
@@ -301,19 +337,23 @@ def compute_assignment(papers, reviewers, recused_pairs=()):
 
 # ---------------------------------------------------------------- 补位求解
 
-def compute_backfill(papers, reviewers, fixed_map, recused_pairs=()):
+def compute_backfill(papers, reviewers, fixed_map, recused_pairs=(), institution_groups=None):
     """补位预演: 仅面向当前发布版内的论文 (papers 已按该范围过滤)。
 
     fixed_map:     {paper_id: [reviewer_id, ...]} 当前发布版中"已确认且未回避"
                    的关系, 这些位置固定不动; 其余位置在原有硬约束与优化次序下重算。
     recused_pairs: {(reviewer_id, paper_id)} 评审人通过决定接口声明的硬回避
                    (与会务方录入的 avoid_papers 等价, 但诊断原因单独标注)。
+    institution_groups: 机构归并组 ({机构原名: 组号}); 固定位置与普通位置一样
+                   按归并组判定同机构, 仅因归并而失效的固定关系以
+                   *_via_merged_group 原因标明。
 
-    数据变更导致固定关系失效时 (评审人被删除/与作者变为同机构/硬回避等),
+    数据变更导致固定关系失效时 (评审人被删除/与作者变为同机构/硬回避/归并后同机构等),
     该固定位置释放为可补位置, 并在 papers[pid].fixed_problems 中说明。
     """
     recused_pairs = set(recused_pairs)
-    solver = Solver(papers, reviewers, recused_pairs)
+    solver = Solver(papers, reviewers, recused_pairs, institution_groups)
+    groups = solver.groups
     reviewer_by_id = {r.reviewer_id: r for r in solver.reviewers}
     paper_by_id = {p.paper_id: p for p in solver.papers}
 
@@ -346,8 +386,13 @@ def compute_backfill(papers, reviewers, fixed_map, recused_pairs=()):
         if len(kept) >= 2:
             a, b = kept[0], kept[1]
             ra, rb = reviewer_by_id[a], reviewer_by_id[b]
-            if ra.institution == rb.institution:
-                problems.append({"reviewer_id": b, "reason": "fixed_pair_violates_institution_rule"})
+            if _inst_key(ra.institution, groups) == _inst_key(rb.institution, groups):
+                reason = (
+                    "fixed_pair_violates_institution_rule"
+                    if ra.institution == rb.institution  # 原始名称直接相同
+                    else "fixed_pair_violates_institution_rule_via_merged_group"  # 仅因归并组
+                )
+                problems.append({"reviewer_id": b, "reason": reason})
                 kept = [a]
             elif not (is_expert(ra, paper_by_id[pid]) or is_expert(rb, paper_by_id[pid])):
                 problems.append({"reviewer_id": b, "reason": "fixed_pair_violates_expert_rule"})
@@ -594,8 +639,7 @@ def _backfill_diagnose(solver, unassigned_ids, loads, caps, pairs_of, fixed,
             reasons.append("eligible_reviewers_at_capacity")
         if not any(is_expert(r, paper) for r in eligible):
             reasons.append("no_expert_among_eligible_reviewers")
-        if len(eligible) >= 2 and len({r.institution for r in eligible}) < 2:
-            reasons.append("eligible_reviewers_share_single_institution")
+        reasons.extend(_single_institution_reasons(eligible, solver.groups))
         if fixed.get(pid):
             if not pairs:
                 reasons.append("no_valid_pair_containing_fixed_reviewer")

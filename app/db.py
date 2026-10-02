@@ -17,6 +17,10 @@
   (仅当某发布序号下两名评审人均已确认且各提交一份正式评语时生成;
   以 (paper_id, serial, receipt1, receipt2) 幂等, 来源变化即新发布序号 -> version+1
   与新随机访问码, 旧码立即失效, 旧版行保留仅供会务方追溯);
+- institution_merge_groups / institution_merge_members 表保存会务方维护的
+  机构归并组 (同一机构的不同名称归为同一冲突判定组): 归并关系传递且不可拆分,
+  成员表把每个机构原名映射到组号; 未归并的名称不在表中, 以自身为冲突判定键;
+  有效归并推进资料修订号, 同组重复提交为幂等请求 (不推进修订号、不写记录);
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
 """
@@ -123,6 +127,19 @@ CREATE TABLE IF NOT EXISTS feedback_snapshots (
     review2      TEXT NOT NULL,   -- 冻结 JSON: {"score":..,"comment":..}
     created_at   TEXT NOT NULL,
     UNIQUE (paper_id, serial, receipt1, receipt2)
+);
+-- 机构归并组: 会务方把同一机构的不同名称归为同一冲突判定组。
+-- 归并关系传递 (并组即合并两个组的全部成员) 且不可拆分 (不提供拆组);
+-- 成员表以机构原名为键映射到组号, 未出现在表中的名称视为独立成组 (以自身为键)。
+-- 原始机构名称在论文/评审人资料中保持原样, 归并只影响冲突判定。
+CREATE TABLE IF NOT EXISTS institution_merge_groups (
+    group_id         TEXT PRIMARY KEY,
+    created_revision INTEGER NOT NULL,  -- 建组时推进后的资料修订号
+    created_at       TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS institution_merge_members (
+    name     TEXT PRIMARY KEY,          -- 机构原名 (论文作者机构或评审人机构中出现)
+    group_id TEXT NOT NULL
 );
 """
 

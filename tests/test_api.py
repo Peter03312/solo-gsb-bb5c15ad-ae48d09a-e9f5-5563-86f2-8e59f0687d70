@@ -22,6 +22,8 @@ def clean_db():
         conn.execute("DELETE FROM papers")
         conn.execute("DELETE FROM reviewers")
         conn.execute("DELETE FROM published")
+        conn.execute("DELETE FROM institution_merge_groups")
+        conn.execute("DELETE FROM institution_merge_members")
         conn.execute("UPDATE meta SET value = '0' WHERE key = 'revision'")
     yield
 

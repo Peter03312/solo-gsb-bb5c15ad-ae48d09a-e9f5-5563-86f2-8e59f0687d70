@@ -38,6 +38,7 @@ def clean_db():
         for table in (
             "papers", "reviewers", "published",
             "assignment_decisions", "reviewer_recusals", "submitted_reviews",
+            "institution_merge_groups", "institution_merge_members",
         ):
             conn.execute(f"DELETE FROM {table}")
         conn.execute("UPDATE meta SET value = '0' WHERE key = 'revision'")
